@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <script>
+    // Streamlit Component communication helper
+    const Streamlit = {
+      setComponentValue: function(value) {
+        window.parent.postMessage({
+          isStreamlitMessage: true,
+          type: "streamlit:setComponentValue",
+          value: value
+        }, "*");
+      },
+      setFrameHeight: function(height) {
+        window.parent.postMessage({
+          isStreamlitMessage: true,
+          type: "streamlit:setFrameHeight",
+          height: height
+        }, "*");
+      }
+    };
+
+    window.addEventListener("message", function(event) {
+      if (event.data.type === "streamlit:render") {
+        const args = event.data.args;
+        if (!args) return;
+        
+        const action = args.action;
+        const key = args.storage_key;
+        const value = args.value;
+
+        if (action === "get") {
+          try {
+            const data = localStorage.getItem(key);
+            Streamlit.setComponentValue({ loaded: true, value: data });
+          } catch (e) {
+            Streamlit.setComponentValue({ loaded: true, value: null, error: e.toString() });
+          }
+        } else if (action === "set") {
+          try {
+            localStorage.setItem(key, value);
+            Streamlit.setComponentValue({ loaded: true, value: value });
+          } catch (e) {
+            Streamlit.setComponentValue({ loaded: true, value: null, error: e.toString() });
+          }
+        } else if (action === "clear") {
+          try {
+            localStorage.removeItem(key);
+            Streamlit.setComponentValue({ loaded: true, value: true });
+          } catch (e) {
+            Streamlit.setComponentValue({ loaded: true, value: false, error: e.toString() });
+          }
+        } else if (action === "get_all") {
+          try {
+            const all_data = {};
+            for (let i = 0; i < localStorage.length; i++) {
+              const k = localStorage.key(i);
+              if (k && (k === "global_session" || k.startsWith("chat_history_"))) {
+                all_data[k] = localStorage.getItem(k);
+              }
+            }
+            Streamlit.setComponentValue({ loaded: true, value: all_data });
+          } catch (e) {
+            Streamlit.setComponentValue({ loaded: true, value: null, error: e.toString() });
+          }
+        } else if (action === "batch") {
+          try {
+            const operations = args.operations;
+            if (operations && Array.isArray(operations)) {
+              for (const op of operations) {
+                if (op.action === "set") {
+                  localStorage.setItem(op.key, op.value);
+                } else if (op.action === "clear") {
+                  localStorage.removeItem(op.key);
+                }
+              }
+            }
+            Streamlit.setComponentValue({ loaded: true, value: true });
+          } catch (e) {
+            Streamlit.setComponentValue({ loaded: true, value: false, error: e.toString() });
+          }
+        }
+      }
+    });
+
+    // Tell Streamlit we're ready
+    window.parent.postMessage({
+      isStreamlitMessage: true,
+      type: "streamlit:componentReady",
+      apiVersion: 1
+    }, "*");
+
+    // Hide frame
+    Streamlit.setFrameHeight(0);
+  </script>
+</head>
+<body>
+</body>
+</html>

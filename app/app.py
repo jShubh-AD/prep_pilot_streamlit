@@ -4,6 +4,10 @@ import os
 import json
 import uuid
 from dotenv import load_dotenv
+import importlib
+import local_storage
+importlib.reload(local_storage)
+from local_storage import local_storage
 
 # Load environmental variables from .env file
 load_dotenv()
@@ -148,44 +152,78 @@ if "tokens_available" not in st.session_state:
 if "api_error" not in st.session_state:
     st.session_state.api_error = None
 
-# Local Session Persistence Helpers
-def get_session_file_path(subject_id: int) -> str:
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir = os.path.join(base_dir, "data")
-    os.makedirs(data_dir, exist_ok=True)
-    return os.path.join(data_dir, f".session_{subject_id}.json")
+# New states for browser-based storage persistence
+if "all_sessions_loaded" not in st.session_state:
+    st.session_state.all_sessions_loaded = False
+if "browser_sessions" not in st.session_state:
+    st.session_state.browser_sessions = {}
+if "pending_ops" not in st.session_state:
+    st.session_state.pending_ops = []
 
+# Local Session Persistence Helpers (reimplemented using browser localStorage)
 def load_session_data(subject_id: int) -> dict | None:
-    try:
-        path = get_session_file_path(subject_id)
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
+    chat_key = f"chat_history_{subject_id}"
+    raw_chat = st.session_state.browser_sessions.get(chat_key)
+    if raw_chat:
+        try:
+            chat_history = json.loads(raw_chat)
+            if chat_history:
+                return {
+                    "session_id": st.session_state.session_id,
+                    "chat_history": chat_history,
+                    "tokens_used": st.session_state.tokens_used,
+                    "tokens_available": st.session_state.tokens_available
+                }
+        except Exception:
+            pass
     return None
 
 def save_session_data(subject_id: int, session_id: str | None, chat_history: list, tokens_used: int, tokens_available: int):
-    try:
-        path = get_session_file_path(subject_id)
-        data = {
-            "session_id": session_id,
-            "chat_history": chat_history,
-            "tokens_used": tokens_used,
-            "tokens_available": tokens_available
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    st.session_state.session_id = session_id
+    st.session_state.tokens_used = tokens_used
+    st.session_state.tokens_available = tokens_available
+    
+    global_session_data = {
+        "session_id": session_id,
+        "tokens_used": tokens_used,
+        "tokens_available": tokens_available
+    }
+    serialized_global = json.dumps(global_session_data)
+    st.session_state.browser_sessions["global_session"] = serialized_global
+    st.session_state.pending_ops.append({
+        "action": "set",
+        "key": "global_session",
+        "value": serialized_global
+    })
+    
+    chat_key = f"chat_history_{subject_id}"
+    serialized_chat = json.dumps(chat_history)
+    st.session_state.browser_sessions[chat_key] = serialized_chat
+    st.session_state.pending_ops.append({
+        "action": "set",
+        "key": chat_key,
+        "value": serialized_chat
+    })
 
 def clear_session_data(subject_id: int):
-    try:
-        path = get_session_file_path(subject_id)
-        if os.path.exists(path):
-            os.remove(path)
-    except Exception:
-        pass
+    chat_key = f"chat_history_{subject_id}"
+    if chat_key in st.session_state.browser_sessions:
+        del st.session_state.browser_sessions[chat_key]
+    st.session_state.pending_ops.append({
+        "action": "clear",
+        "key": chat_key
+    })
+    
+    st.session_state.session_id = None
+    st.session_state.tokens_used = 0
+    st.session_state.tokens_available = 20000
+    
+    if "global_session" in st.session_state.browser_sessions:
+        del st.session_state.browser_sessions["global_session"]
+    st.session_state.pending_ops.append({
+        "action": "clear",
+        "key": "global_session"
+    })
 
 
 # Backend Connection Checker
@@ -363,15 +401,9 @@ def page_select_subject():
                     st.session_state.selected_subject_id = sub["subject_id"]
                     st.session_state.selected_subject_name = sub["subject_name"]
                     if has_session:
-                        st.session_state.session_id = local_sess.get("session_id")
                         st.session_state.chat_history = local_sess.get("chat_history", [])
-                        st.session_state.tokens_used = local_sess.get("tokens_used", 0)
-                        st.session_state.tokens_available = local_sess.get("tokens_available", 20000)
                     else:
-                        st.session_state.session_id = None
                         st.session_state.chat_history = []
-                        st.session_state.tokens_used = 0
-                        st.session_state.tokens_available = 20000
                     st.session_state.page = "chat"
                     st.rerun()
     else:
@@ -443,11 +475,8 @@ def page_chat():
         
         # Navigation/Reset Action buttons
         if st.button("🔄 Reset Conversation", use_container_width=True):
-            st.session_state.session_id = None
-            st.session_state.chat_history = []
-            st.session_state.tokens_used = 0
-            st.session_state.tokens_available = 20000
             clear_session_data(subject_id)
+            st.session_state.chat_history = []
             st.success("Conversation reset!")
             st.rerun()
             
@@ -534,11 +563,43 @@ def page_chat():
 # ========================================================
 # MAIN ROUTER
 # ========================================================
+# MAIN ROUTER
+# ========================================================
 def main():
+    # 1. Initial Load of all browser sessions
+    if not st.session_state.all_sessions_loaded:
+        st.markdown('<div class="gradient-title">PrepPilot Study Companion</div>', unsafe_allow_html=True)
+        st.markdown('<div class="gradient-subtitle">Restoring your browser study sessions...</div>', unsafe_allow_html=True)
+        
+        with st.spinner("Syncing with your browser storage..."):
+            res = local_storage("get_all", "", element_key="load_all_sessions")
+            if res is not None and isinstance(res, dict) and res.get("loaded"):
+                st.session_state.browser_sessions = res.get("value") or {}
+                # Extract the global session if it exists
+                raw_global = st.session_state.browser_sessions.get("global_session")
+                if raw_global:
+                    try:
+                        global_data = json.loads(raw_global)
+                        st.session_state.session_id = global_data.get("session_id")
+                        st.session_state.tokens_used = global_data.get("tokens_used", 0)
+                        st.session_state.tokens_available = global_data.get("tokens_available", 20000)
+                    except Exception:
+                        pass
+                st.session_state.all_sessions_loaded = True
+                st.rerun()
+            return
+
+    # 2. Render page
     if st.session_state.page == "select_subject":
         page_select_subject()
     elif st.session_state.page == "chat":
         page_chat()
+
+    # 3. Handle pending storage updates
+    if st.session_state.pending_ops:
+        ops = st.session_state.pending_ops
+        st.session_state.pending_ops = []
+        local_storage("batch", operations=ops, element_key="save_local_storage")
 
 if __name__ == "__main__":
     main()
