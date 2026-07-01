@@ -148,7 +148,7 @@ if "chat_history" not in st.session_state:
 if "tokens_used" not in st.session_state:
     st.session_state.tokens_used = 0
 if "tokens_available" not in st.session_state:
-    st.session_state.tokens_available = 20000
+    st.session_state.tokens_available = 2000
 if "api_error" not in st.session_state:
     st.session_state.api_error = None
 
@@ -216,7 +216,7 @@ def clear_session_data(subject_id: int):
     
     st.session_state.session_id = None
     st.session_state.tokens_used = 0
-    st.session_state.tokens_available = 20000
+    st.session_state.tokens_available = 2000
     
     if "global_session" in st.session_state.browser_sessions:
         del st.session_state.browser_sessions["global_session"]
@@ -264,6 +264,36 @@ def create_subject(subject_name: str):
         st.error(f"Error creating subject: {e}")
         return None
 
+# Fetch session details from backend
+def fetch_backend_session(session_id: str) -> dict | None:
+    try:
+        response = httpx.get(f"{st.session_state.backend_url}/chats/sessions/{session_id}", timeout=5.0)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("success"):
+                return data.get("data")
+        return None
+    except Exception as e:
+        # Silently fail if server is not fully initialized, or log error
+        return None
+
+# Fetch chat messages from backend and convert to frontend schema
+def fetch_backend_chats(session_id: str, subject_id: int) -> list | None:
+    try:
+        response = httpx.get(f"{st.session_state.backend_url}/chats/{session_id}/{subject_id}", timeout=5.0)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("success"):
+                raw_messages = data.get("data", [])
+                formatted_messages = []
+                for msg in raw_messages:
+                    role = "user" if msg.get("r") == "u" else "assistant"
+                    formatted_messages.append({"role": role, "content": msg.get("c", "")})
+                return formatted_messages
+        return None
+    except Exception:
+        return None
+
 # SSE Chat Query Stream Generator
 def ask_query_stream(query: str, subject_id: int, session_id: str | None):
     payload = {
@@ -293,26 +323,46 @@ def ask_query_stream(query: str, subject_id: int, session_id: str | None):
                 }
                 return
             
-            for line in r.iter_lines():
-                if line.startswith("data:"):
-                    data_str = line[5:].strip()
-                    if not data_str:
-                        continue
-                    try:
-                        data_json = json.loads(data_str)
-                        if isinstance(data_json, dict):
-                            if data_json.get("done") is True:
-                                # Update global states on complete response
-                                st.session_state.session_id = data_json.get("session_id")
-                                st.session_state.tokens_used = data_json.get("tokens_used", 0)
-                                st.session_state.tokens_available = data_json.get("tokens_available", 20000)
-                            elif "text" in data_json:
-                                yield data_json["text"]
+            is_sse = "text/event-stream" in r.headers.get("content-type", "").lower()
+            
+            if is_sse:
+                for line in r.iter_lines():
+                    if line.startswith("data:"):
+                        # Extract the data content
+                        if line.startswith("data: "):
+                            data_str = line[6:]
                         else:
-                            yield str(data_json)
-                    except json.JSONDecodeError:
-                        # Raw text chunk
-                        yield data_str
+                            data_str = line[5:]
+                        
+                        # Strip trailing \r if any
+                        data_str = data_str.rstrip('\r')
+                        try:
+                            data_json = json.loads(data_str)
+                            if isinstance(data_json, dict):
+                                if "message" in data_json:
+                                    st.session_state.api_error = {
+                                        "status_code": 400,
+                                        "detail": data_json["message"]
+                                    }
+                                    return
+                                elif "tokens_available" in data_json or data_json.get("done") is True:
+                                    # Update global states on complete response
+                                    st.session_state.session_id = data_json.get("session_id")
+                                    st.session_state.tokens_used = data_json.get("tokens_used", 0)
+                                    st.session_state.tokens_available = data_json.get("tokens_available", 2000)
+                                elif "text" in data_json:
+                                    yield data_json["text"]
+                            else:
+                                yield str(data_json)
+                        except json.JSONDecodeError:
+                            # Raw text chunk
+                            if not data_str:
+                                yield "\n"
+                            else:
+                                yield data_str
+            else:
+                for chunk in r.iter_text():
+                    yield chunk
     except Exception as e:
         st.session_state.api_error = {
             "status_code": 500,
@@ -400,10 +450,42 @@ def page_select_subject():
                 if st.button("Enter Chat Room", key=f"sub_btn_{sub['subject_id']}", use_container_width=True):
                     st.session_state.selected_subject_id = sub["subject_id"]
                     st.session_state.selected_subject_name = sub["subject_name"]
-                    if has_session:
-                        st.session_state.chat_history = local_sess.get("chat_history", [])
-                    else:
-                        st.session_state.chat_history = []
+                    
+                    # Try to restore session and chat history from backend if session_id exists
+                    session_synced = False
+                    if st.session_state.session_id:
+                        # 1. Verify session on backend
+                        backend_sess = fetch_backend_session(st.session_state.session_id)
+                        if backend_sess:
+                            st.session_state.tokens_used = backend_sess.get("tokens_used", 0)
+                            st.session_state.tokens_available = 2000 - st.session_state.tokens_used
+                            
+                            # 2. Fetch messages from backend
+                            backend_chats = fetch_backend_chats(st.session_state.session_id, sub["subject_id"])
+                            if backend_chats is not None:
+                                st.session_state.chat_history = backend_chats
+                                session_synced = True
+                                # Also update local storage cache
+                                save_session_data(
+                                    sub["subject_id"],
+                                    st.session_state.session_id,
+                                    st.session_state.chat_history,
+                                    st.session_state.tokens_used,
+                                    st.session_state.tokens_available
+                                )
+                        else:
+                            # Backend session expired/not found, clear it
+                            clear_session_data(sub["subject_id"])
+                            st.session_state.chat_history = []
+                            session_synced = True
+                    
+                    # Fallback to local storage if not synced
+                    if not session_synced:
+                        if has_session:
+                            st.session_state.chat_history = local_sess.get("chat_history", [])
+                        else:
+                            st.session_state.chat_history = []
+                            
                     st.session_state.page = "chat"
                     st.rerun()
     else:
@@ -442,9 +524,7 @@ def page_chat():
         # Token metrics
         used = st.session_state.tokens_used
         avail = st.session_state.tokens_available
-        total = used + avail
-        if total == 0:
-            total = 20000
+        total = 2000
         
         # Calculate ratio
         ratio = float(used) / float(total) if total > 0 else 0.0
@@ -491,7 +571,7 @@ def page_chat():
     # Display Chat History
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+            st.markdown(msg["content"], unsafe_allow_html=True)
             
     # Chat input
     if prompt := st.chat_input(f"Ask a question about {subject_name}..."):
@@ -509,7 +589,7 @@ def page_chat():
             
         # Display user message
         with st.chat_message("user"):
-            st.markdown(prompt)
+            st.markdown(prompt, unsafe_allow_html=True)
         
         # Add to history
         st.session_state.chat_history.append({"role": "user", "content": prompt})
@@ -531,15 +611,15 @@ def page_chat():
             # Now stream the rest of the response
             full_response += first_chunk
             if full_response:
-                response_placeholder.markdown(full_response + "▌")
+                response_placeholder.markdown(full_response + "▌", unsafe_allow_html=True)
             
             # Read from generator chunk by chunk
             for chunk in stream_gen:
                 full_response += chunk
-                response_placeholder.markdown(full_response + "▌")
+                response_placeholder.markdown(full_response + "▌", unsafe_allow_html=True)
             
             # Remove cursor and update final markdown
-            response_placeholder.markdown(full_response)
+            response_placeholder.markdown(full_response, unsafe_allow_html=True)
             
         # Check if error occurred during request
         if st.session_state.api_error:
@@ -580,9 +660,21 @@ def main():
                 if raw_global:
                     try:
                         global_data = json.loads(raw_global)
-                        st.session_state.session_id = global_data.get("session_id")
-                        st.session_state.tokens_used = global_data.get("tokens_used", 0)
-                        st.session_state.tokens_available = global_data.get("tokens_available", 20000)
+                        session_id = global_data.get("session_id")
+                        if session_id:
+                            backend_sess = fetch_backend_session(session_id)
+                            if backend_sess:
+                                st.session_state.session_id = session_id
+                                st.session_state.tokens_used = backend_sess.get("tokens_used", 0)
+                                st.session_state.tokens_available = 2000 - st.session_state.tokens_used
+                            else:
+                                st.session_state.session_id = None
+                                st.session_state.tokens_used = 0
+                                st.session_state.tokens_available = 2000
+                        else:
+                            st.session_state.session_id = None
+                            st.session_state.tokens_used = 0
+                            st.session_state.tokens_available = 2000
                     except Exception:
                         pass
                 st.session_state.all_sessions_loaded = True
